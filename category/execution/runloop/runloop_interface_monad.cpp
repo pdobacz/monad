@@ -33,12 +33,14 @@
 #include <category/mpt/db.hpp>
 #include <category/vm/vm.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include <quill/LogLevel.h>
 #include <quill/Quill.h>
@@ -52,7 +54,11 @@ namespace fs = std::filesystem;
 
 MONAD_ANONYMOUS_NAMESPACE_BEGIN
 
-unsigned const sq_thread_cpu = 7;
+// Pin the io_uring SQPOLL thread outside the worker CPUs where it
+// can; fall back to the highest available CPU on smaller hosts
+// (IORING_SETUP_SQ_AFF rejects an out-of-range CPU with EINVAL).
+unsigned const sq_thread_cpu =
+    std::min(7u, std::max(1u, std::thread::hardware_concurrency()) - 1u);
 quill::LogLevel const log_level = quill::LogLevel::Info;
 unsigned const nthreads = 4;
 unsigned const nfibers = 256;
