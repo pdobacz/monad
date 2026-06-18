@@ -18,7 +18,7 @@
 #include <category/execution/ethereum/block_hash_buffer.hpp>
 #include <category/execution/ethereum/core/fmt/bytes_fmt.hpp>
 #include <category/execution/ethereum/db/block_db.hpp>
-#include <category/execution/ethereum/db/db_cache.hpp>
+#include <category/execution/ethereum/db/state_machine_init.hpp>
 #include <category/execution/ethereum/db/trie_db.hpp>
 #include <category/execution/ethereum/state2/block_state.hpp>
 #include <category/execution/ethereum/state3/state.hpp>
@@ -28,6 +28,7 @@
 #include <category/execution/monad/chain/monad_devnet.hpp>
 #include <category/execution/monad/chain/monad_mainnet.hpp>
 #include <category/execution/monad/chain/monad_testnet.hpp>
+#include <category/execution/monad/db/state_machine_init.hpp>
 #include <category/execution/runloop/runloop_interface_monad.h>
 #include <category/execution/runloop/runloop_monad.hpp>
 #include <category/mpt/db.hpp>
@@ -89,16 +90,21 @@ struct AccountOverride
 struct MonadRunloopDbCache : public Db
 {
     std::unordered_map<Address, AccountOverride> account_override;
-    DbCache &db_cache;
+    Db &inner;
 
-    MonadRunloopDbCache(DbCache &dbc)
-        : db_cache{dbc}
+    MonadRunloopDbCache(Db &inner_arg)
+        : inner{inner_arg}
     {
+    }
+
+    virtual bool is_page_encoded() const override
+    {
+        return inner.is_page_encoded();
     }
 
     virtual std::optional<Account> read_account(Address const &address) override
     {
-        auto acct = db_cache.read_account(address);
+        auto acct = inner.read_account(address);
         auto const over_it = account_override.find(address);
         if (over_it == account_override.end()) {
             return acct;
@@ -116,143 +122,96 @@ struct MonadRunloopDbCache : public Db
         Address const &address, Incarnation const incarnation,
         bytes32_t const &key) override
     {
-        return db_cache.read_storage(address, incarnation, key);
+        return inner.read_storage(address, incarnation, key);
+    }
+
+    virtual storage_page_t read_storage_page(
+        Address const &address, Incarnation const incarnation,
+        bytes32_t const &page_key) override
+    {
+        return inner.read_storage_page(address, incarnation, page_key);
     }
 
     virtual vm::SharedIntercode read_code(bytes32_t const &code_hash) override
     {
-        return db_cache.read_code(code_hash);
+        return inner.read_code(code_hash);
     }
 
     virtual void set_block_and_prefix(
         uint64_t const block_number,
         bytes32_t const &block_id = bytes32_t{}) override
     {
-        db_cache.set_block_and_prefix(block_number, block_id);
+        inner.set_block_and_prefix(block_number, block_id);
     }
 
     virtual void
     finalize(uint64_t const block_number, bytes32_t const &block_id) override
     {
-        db_cache.finalize(block_number, block_id);
+        inner.finalize(block_number, block_id);
     }
 
     virtual void update_verified_block(uint64_t const block_number) override
     {
-        db_cache.update_verified_block(block_number);
+        inner.update_verified_block(block_number);
     }
 
     virtual void update_voted_metadata(
         uint64_t const block_number, bytes32_t const &block_id) override
     {
-        db_cache.update_voted_metadata(block_number, block_id);
+        inner.update_voted_metadata(block_number, block_id);
     }
 
     virtual void update_proposed_metadata(
         uint64_t const block_number, bytes32_t const &block_id) override
     {
-        db_cache.update_proposed_metadata(block_number, block_id);
+        inner.update_proposed_metadata(block_number, block_id);
     }
 
+    // Two-stage commit (vicky page-store API). The eest-runner never calls
+    // set_balance, so account_override is always empty here; reads apply
+    // overrides, and commit simply delegates to the wrapped Db.
     virtual void commit(
-        StateDeltas const &, Code const &, bytes32_t const &,
-        BlockHeader const &, std::vector<Receipt> const &,
-        std::vector<std::vector<CallFrame>> const &,
-        std::vector<Address> const &, std::vector<Transaction> const &,
-        std::vector<BlockHeader> const &,
-        std::optional<std::vector<Withdrawal>> const &) override
+        bytes32_t const &block_id, CommitBuilder &builder,
+        BlockHeader const &header, StateDeltas const &state_deltas,
+        std::function<void(BlockHeader &)> populate_header_fn) override
     {
-        MONAD_ABORT("Use commit function with unique_ptr arg.");
-    }
-
-    virtual void commit(
-        std::unique_ptr<StateDeltas> pre_state_deltas, Code const &code,
-        bytes32_t const &block_id, BlockHeader const &header,
-        std::vector<Receipt> const &receipts = {},
-        std::vector<std::vector<CallFrame>> const &call_frames = {},
-        std::vector<Address> const &senders = {},
-        std::vector<Transaction> const &transactions = {},
-        std::vector<BlockHeader> const &ommers = {},
-        std::optional<std::vector<Withdrawal>> const &withdrawals = {}) override
-    {
-        auto state_deltas = std::make_unique<StateDeltas>();
-        for (auto const &[a, sd] : *pre_state_deltas) {
-            auto over_it = account_override.find(a);
-            if (over_it == account_override.end()) {
-                state_deltas->emplace(a, sd);
-            }
-            else {
-                auto const orig = db_cache.read_account(a);
-                AccountDelta const ad{orig, sd.account.second};
-                StateDelta new_sd{ad, sd.storage};
-                state_deltas->emplace(a, new_sd);
-                account_override.erase(over_it);
-            }
-        }
-        for (auto const &[a, over] : account_override) {
-            auto const orig_acct = db_cache.read_account(a);
-            if (orig_acct) {
-                auto over_acct = orig_acct;
-                over_acct->balance = over.balance;
-                AccountDelta const ad{orig_acct, over_acct};
-                StateDelta const sd{ad, {}};
-                state_deltas->emplace(a, sd);
-            }
-            else {
-                auto over_acct = std::make_optional<Account>();
-                over_acct->balance = over.balance;
-                AccountDelta const ad{std::nullopt, over_acct};
-                StateDelta const sd{ad, {}};
-                state_deltas->emplace(a, sd);
-            }
-        }
-        account_override.clear();
-        db_cache.commit(
-            std::move(state_deltas),
-            code,
-            block_id,
-            header,
-            receipts,
-            call_frames,
-            senders,
-            transactions,
-            ommers,
-            withdrawals);
+        inner.commit(
+            block_id, builder, header, state_deltas, populate_header_fn);
     }
 
     virtual BlockHeader read_eth_header() override
     {
-        return db_cache.read_eth_header();
+        return inner.read_eth_header();
     }
 
     virtual bytes32_t state_root() override
     {
-        return db_cache.state_root();
+        return inner.state_root();
     }
 
     virtual bytes32_t receipts_root() override
     {
-        return db_cache.receipts_root();
+        return inner.receipts_root();
     }
 
     virtual bytes32_t transactions_root() override
     {
-        return db_cache.transactions_root();
+        return inner.transactions_root();
     }
 
     virtual std::optional<bytes32_t> withdrawals_root() override
     {
-        return db_cache.withdrawals_root();
+        return inner.withdrawals_root();
     }
 
     virtual std::string print_stats() override
     {
-        return db_cache.print_stats();
+        return inner.print_stats();
     }
 
     virtual uint64_t get_block_number() const override
     {
-        return db_cache.get_block_number();
+        return inner.get_block_number();
     }
 };
 
@@ -260,10 +219,8 @@ struct MonadRunloopImpl
 {
     std::unique_ptr<MonadChain> chain;
     fs::path ledger_dir;
-    OnDiskMachine db_machine;
     mpt::Db raw_db;
     TrieDb triedb;
-    DbCache db_cache;
     MonadRunloopDbCache db;
     vm::VM vm;
     BlockHashBufferFinalized block_hash_buffer;
@@ -281,11 +238,24 @@ MonadRunloopImpl::MonadRunloopImpl(
     char const *db_path)
     : chain{std::move(chain_arg)}
     , ledger_dir{ledger_path}
-    , db_machine{}
-    , raw_db{db_machine, mpt::OnDiskDbConfig{.append = true, .compaction = true, .rewind_to_latest_finalized = true, .rd_buffers = 8192, .wr_buffers = 32, .uring_entries = 128, .sq_thread_cpu = sq_thread_cpu, .dbname_paths = {fs::path{db_path}}}}
+    , raw_db{[&] {
+        // The on-disk Db ctor constructs the StateMachine from the
+        // persisted state_machine_kind via these registries, so they must
+        // be registered first.
+        register_ethereum_state_machines();
+        register_monad_state_machines();
+        return mpt::Db{mpt::OnDiskDbConfig{
+            .append = true,
+            .compaction = true,
+            .rewind_to_latest_finalized = true,
+            .rd_buffers = 8192,
+            .wr_buffers = 32,
+            .uring_entries = 128,
+            .sq_thread_cpu = sq_thread_cpu,
+            .dbname_paths = {fs::path{db_path}}}};
+    }()}
     , triedb{raw_db}
-    , db_cache{triedb}
-    , db{db_cache}
+    , db{triedb}
     , vm{}
     , block_hash_buffer{}
     , priority_pool{nthreads, nfibers}
@@ -336,7 +306,13 @@ Address to_address(MonadRunloopAddress const *a)
 
 uint256_t to_uint256(MonadRunloopWord const *x)
 {
-    return intx::be::load<uint256_t>(*x);
+    // Big-endian load (avoids intx::be, whose as_bytes/bswap clash with
+    // `using namespace monad`). Only used by the unused get/set_balance FFI.
+    uint256_t r{};
+    for (auto const b : x->bytes) {
+        r = (r << 8) | uint256_t{b};
+    }
+    return r;
 }
 
 MONAD_ANONYMOUS_NAMESPACE_END
@@ -433,6 +409,7 @@ try {
         runloop->block_num + nblocks - 1,
         stop,
         /* enable_tracing = */ false,
+        /* secondary_db = */ nullptr,
         /* is_first_run = */ runloop->is_first_run);
 
     runloop->is_first_run = false;
@@ -474,7 +451,11 @@ extern "C" void monad_runloop_get_balance(
     if (acct) {
         bal = acct->balance;
     }
-    intx::be::store(result_balance->bytes, bal);
+    // Big-endian store (see to_uint256).
+    for (int i = 31; i >= 0; --i) {
+        result_balance->bytes[i] = static_cast<uint8_t>(bal);
+        bal >>= 8;
+    }
 }
 
 extern "C" void monad_runloop_get_state_root(
