@@ -221,6 +221,12 @@ struct MonadRunloopImpl
     fs::path ledger_dir;
     mpt::Db raw_db;
     TrieDb triedb;
+    // Dual-db migration: a page-encoded secondary timeline (if activated
+    // on the db) runs alongside the slot-encoded primary so a
+    // MONAD_NINE->MONAD_NEXT transition can cross the page-encoding
+    // boundary. Empty for single-encoding (pure pre-MIP-8 or pure MIP-8).
+    std::optional<mpt::Db> secondary_raw_db;
+    std::optional<TrieDb> secondary_triedb;
     MonadRunloopDbCache db;
     vm::VM vm;
     BlockHashBufferFinalized block_hash_buffer;
@@ -262,10 +268,30 @@ MonadRunloopImpl::MonadRunloopImpl(
     , block_num{1}
     , is_first_run{true}
 {
+    // Open the page-encoded secondary timeline for dual-write migration
+    // mode (slot primary + page secondary), if it was activated on the db.
+    bool const secondary_active =
+        raw_db.timeline_active(mpt::timeline_id::secondary);
+    LOG_INFO("dual-db: secondary timeline active = {}", secondary_active);
+    if (secondary_active) {
+        secondary_raw_db = raw_db.open_secondary_timeline();
+        MONAD_ASSERT(secondary_raw_db.has_value());
+        secondary_triedb.emplace(*secondary_raw_db);
+        MONAD_ASSERT(
+            secondary_triedb->is_page_encoded(),
+            "secondary timeline must be page-encoded");
+        LOG_INFO("dual-db: opened page-encoded secondary timeline");
+    }
+
     if (triedb.get_root() == nullptr) {
         LOG_INFO("loading from genesis");
         GenesisState const genesis_state = chain->get_genesis_state();
         load_genesis_state(genesis_state, triedb);
+        // Seed the secondary with the same genesis so dual-writes build on
+        // a consistent page-encoded base.
+        if (secondary_triedb.has_value()) {
+            load_genesis_state(genesis_state, *secondary_triedb);
+        }
     }
     else {
         LOG_INFO("loading from previous DB state");
@@ -409,7 +435,9 @@ try {
         runloop->block_num + nblocks - 1,
         stop,
         /* enable_tracing = */ false,
-        /* secondary_db = */ nullptr,
+        /* secondary_db = */ runloop->secondary_triedb.has_value()
+            ? &*runloop->secondary_triedb
+            : nullptr,
         /* is_first_run = */ runloop->is_first_run);
 
     runloop->is_first_run = false;
@@ -462,8 +490,13 @@ extern "C" void monad_runloop_get_state_root(
     MonadRunloop *pre_runloop, MonadRunloopWord *result_state_root)
 {
     MonadRunloopImpl *const runloop = to_impl(pre_runloop);
-    *result_state_root =
-        std::bit_cast<MonadRunloopWord>(runloop->db.state_root());
+    // In dual-db migration mode the canonical final state_root is the
+    // page-encoded secondary's (transition fixtures end post-fork in
+    // MONAD_NEXT); the slot primary holds the pre-fork-encoded root.
+    bytes32_t const root = runloop->secondary_triedb.has_value()
+                               ? runloop->secondary_triedb->state_root()
+                               : runloop->db.state_root();
+    *result_state_root = std::bit_cast<MonadRunloopWord>(root);
 }
 
 extern "C" void monad_runloop_dump(MonadRunloop *pre_runloop)
