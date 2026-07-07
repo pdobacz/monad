@@ -16,6 +16,7 @@
 #include <category/core/fiber/priority_pool.hpp>
 #include <category/core/monad_exception.hpp>
 #include <category/execution/ethereum/block_hash_buffer.hpp>
+#include <category/execution/ethereum/block_hash_buffer/util.hpp>
 #include <category/execution/ethereum/core/fmt/bytes_fmt.hpp>
 #include <category/execution/ethereum/db/block_db.hpp>
 #include <category/execution/ethereum/db/state_machine_init.hpp>
