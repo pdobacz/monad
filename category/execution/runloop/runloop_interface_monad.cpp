@@ -261,7 +261,7 @@ MonadRunloopImpl::MonadRunloopImpl(
             .sq_thread_cpu = sq_thread_cpu,
             .dbname_paths = {fs::path{db_path}}}};
     }()}
-    , triedb{raw_db}
+    , triedb{raw_db, true}
     , db{triedb}
     , vm{}
     , block_hash_buffer{}
