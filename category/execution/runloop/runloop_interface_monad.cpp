@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <category/core/fiber/priority_pool.hpp>
+#include <category/core/log.hpp>
 #include <category/core/monad_exception.hpp>
 #include <category/execution/ethereum/block_hash_buffer.hpp>
 #include <category/execution/ethereum/block_hash_buffer/util.hpp>
@@ -43,10 +44,6 @@
 #include <sstream>
 #include <string>
 #include <thread>
-
-#include <quill/LogLevel.h>
-#include <quill/Quill.h>
-#include <quill/handlers/FileHandler.h>
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -348,18 +345,7 @@ MONAD_ANONYMOUS_NAMESPACE_BEGIN
 
 void monad_runloop_init_logging()
 {
-    auto stdout_handler = quill::stdout_handler();
-    stdout_handler->set_pattern(
-        "%(time) [%(thread_id)] %(file_name):%(line_number) LOG_%(log_level)\t"
-        "%(message)",
-        "%Y-%m-%d %H:%M:%S.%Qns",
-        quill::Timezone::GmtTime);
-    quill::Config quill_cfg;
-    quill_cfg.default_handlers.emplace_back(stdout_handler);
-    quill::configure(quill_cfg);
-    quill::start(true);
-
-    quill::get_root_logger()->set_log_level(log_level);
+    init_root_logger(log_level);
 }
 
 MONAD_ANONYMOUS_NAMESPACE_END
