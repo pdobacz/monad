@@ -19,11 +19,13 @@
 #include <category/execution/ethereum/block_hash_buffer.hpp>
 #include <category/execution/ethereum/block_hash_buffer/util.hpp>
 #include <category/execution/ethereum/core/fmt/bytes_fmt.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
 #include <category/execution/ethereum/db/block_db.hpp>
 #include <category/execution/ethereum/db/state_machine_init.hpp>
 #include <category/execution/ethereum/db/trie_db.hpp>
 #include <category/execution/ethereum/state2/block_state.hpp>
 #include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/monad/chain/eest_net.hpp>
 #include <category/execution/monad/chain/monad_chain.hpp>
 #include <category/execution/monad/chain/monad_devnet.hpp>
 #include <category/execution/monad/chain/monad_mainnet.hpp>
@@ -34,8 +36,16 @@
 #include <category/mpt/db.hpp>
 #include <category/vm/vm.hpp>
 
+#include <evmc/hex.hpp>
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -45,7 +55,11 @@ namespace fs = std::filesystem;
 
 MONAD_ANONYMOUS_NAMESPACE_BEGIN
 
-unsigned const sq_thread_cpu = 7;
+// Pin the io_uring SQPOLL thread outside the worker CPUs where it
+// can; fall back to the highest available CPU on smaller hosts
+// (IORING_SETUP_SQ_AFF rejects an out-of-range CPU with EINVAL).
+unsigned const sq_thread_cpu =
+    std::min(7u, std::max(1u, std::thread::hardware_concurrency()) - 1u);
 quill::LogLevel const log_level = quill::LogLevel::Info;
 unsigned const nthreads = 4;
 unsigned const nfibers = 256;
@@ -222,13 +236,14 @@ struct MonadRunloopImpl
     uint64_t start_block_num;
 
     MonadRunloopImpl(
-        uint64_t chain_id, char const *ledger_path, char const *db_path);
+        std::unique_ptr<MonadChain> chain, char const *ledger_path,
+        char const *db_path, bool verbatim_genesis_header = false);
 };
 
 MonadRunloopImpl::MonadRunloopImpl(
-    uint64_t const chain_id, char const *const ledger_path,
-    char const *const db_path)
-    : chain{monad_chain_from_chain_id(chain_id)}
+    std::unique_ptr<MonadChain> chain_arg, char const *const ledger_path,
+    char const *const db_path, bool const verbatim_genesis_header)
+    : chain{std::move(chain_arg)}
     , ledger_dir{ledger_path}
     , raw_db{mpt::OnDiskDbConfig{
           .append = true,
@@ -252,7 +267,7 @@ MonadRunloopImpl::MonadRunloopImpl(
     if (triedb.get_root() == nullptr) {
         LOG_INFO("loading from genesis");
         GenesisState const genesis_state = chain->get_genesis_state();
-        load_genesis_state(genesis_state, triedb);
+        load_genesis_state(genesis_state, triedb, verbatim_genesis_header);
     }
     else {
         LOG_INFO("loading from previous DB state");
@@ -271,7 +286,7 @@ MonadRunloopImpl::MonadRunloopImpl(
         init_block_hash_buffer_from_triedb(rodb, block_num, block_hash_buffer);
     if (!have_headers) {
         BlockDb block_db{ledger_path};
-        MONAD_ASSERT(chain_id == mainnet_chain_id);
+        MONAD_ASSERT(chain->get_chain_id() == mainnet_chain_id);
         MONAD_ASSERT(init_block_hash_buffer_from_blockdb(
             block_db, block_num, block_hash_buffer));
     }
@@ -363,9 +378,9 @@ public:
 
 MONAD_ANONYMOUS_NAMESPACE_END
 
-extern "C" MonadRunloop *monad_runloop_new(
-    uint64_t const chain_id, char const *const ledger_path,
-    char const *const db_path)
+MONAD_ANONYMOUS_NAMESPACE_BEGIN
+
+void monad_runloop_init()
 {
     static bool is_quill_running;
     if (!is_quill_running) {
@@ -377,7 +392,63 @@ extern "C" MonadRunloop *monad_runloop_new(
     // registered first. Idempotent.
     register_ethereum_state_machines();
     register_monad_state_machines();
-    return from_impl(new MonadRunloopImpl{chain_id, ledger_path, db_path});
+}
+
+MONAD_ANONYMOUS_NAMESPACE_END
+
+extern "C" MonadRunloop *monad_runloop_new(
+    uint64_t const chain_id, char const *const ledger_path,
+    char const *const db_path)
+{
+    monad_runloop_init();
+    return from_impl(new MonadRunloopImpl{
+        monad_chain_from_chain_id(chain_id), ledger_path, db_path});
+}
+
+extern "C" MonadRunloop *monad_runloop_new_eest(
+    char const *const ledger_path, char const *const db_path,
+    char const *const genesis_alloc_json,
+    char const *const genesis_block_rlp_hex,
+    char const *const revision_schedule)
+{
+    monad_runloop_init();
+    MONAD_ASSERT(genesis_alloc_json != nullptr);
+    MONAD_ASSERT(genesis_block_rlp_hex != nullptr);
+    MONAD_ASSERT(revision_schedule != nullptr);
+    auto const genesis_block_rlp =
+        evmc::from_hex(std::string_view{genesis_block_rlp_hex});
+    MONAD_ASSERT(genesis_block_rlp.has_value());
+    byte_string_view genesis_block_rlp_view{
+        genesis_block_rlp->data(), genesis_block_rlp->size()};
+    auto const genesis_block = rlp::decode_block(genesis_block_rlp_view);
+    MONAD_ASSERT(!genesis_block.has_error());
+
+    // Parse "<revision>:<from timestamp>,..." into the schedule.
+    EestNetRevisionSchedule schedule;
+    std::istringstream stream{revision_schedule};
+    std::string entry;
+    while (std::getline(stream, entry, ',')) {
+        auto const sep = entry.find(':');
+        MONAD_ASSERT(sep != std::string::npos);
+        auto const revision = std::stoul(entry.substr(0, sep));
+        MONAD_ASSERT(revision <= MONAD_NEXT);
+        auto const from_timestamp = std::stoull(entry.substr(sep + 1));
+        schedule.emplace_back(
+            from_timestamp, static_cast<monad_revision>(revision));
+    }
+
+    // The fixture's genesis header must be stored verbatim: re-stamping
+    // its roots from the db would change the stored genesis header hash,
+    // which BLOCKHASH, EIP-2935 and block 1's parent hash all derive
+    // from.
+    return from_impl(new MonadRunloopImpl{
+        std::make_unique<EestNet>(
+            std::string{genesis_alloc_json},
+            genesis_block.assume_value().header,
+            std::move(schedule)),
+        ledger_path,
+        db_path,
+        /* verbatim_genesis_header = */ true});
 }
 
 extern "C" void monad_runloop_delete(MonadRunloop *const runloop)
@@ -472,4 +543,16 @@ extern "C" void monad_runloop_dump(MonadRunloop *const pre_runloop)
 {
     MonadRunloopImpl *const runloop = to_impl(pre_runloop);
     std::cout << runloop->triedb.to_json().dump(4) << std::endl;
+}
+
+extern "C" char *monad_runloop_dump_json(MonadRunloop *const pre_runloop)
+{
+    MonadRunloopImpl *const runloop = to_impl(pre_runloop);
+    auto const json = runloop->triedb.to_json().dump();
+    return strdup(json.c_str());
+}
+
+extern "C" void monad_runloop_free_string(char *const str)
+{
+    free(str);
 }
