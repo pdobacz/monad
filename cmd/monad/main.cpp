@@ -344,6 +344,48 @@ try {
     TrieDb triedb{
         raw_db,
         /*enable_multiblock_cache=*/true};
+
+    // Dual-timeline migration: open the page-encoded secondary alongside the
+    // slot-encoded primary. Opened before the init logic below, which
+    // consults it to recover an archive db whose slot primary stopped
+    // committing at the mip-8 cutoff.
+    std::optional<mpt::Db> secondary_raw_db;
+    std::optional<TrieDb> secondary_db;
+    if (!db_in_memory &&
+        raw_db.timeline_active(monad::mpt::timeline_id::secondary)) {
+        secondary_raw_db = raw_db.open_secondary_timeline();
+        MONAD_ASSERT(secondary_raw_db.has_value());
+        secondary_db.emplace(*secondary_raw_db);
+        MONAD_ASSERT(
+            secondary_db->is_page_encoded(),
+            "secondary timeline must be page-encoded");
+        MONAD_ASSERT(
+            !triedb.is_page_encoded(),
+            "primary must be slot-encoded when the secondary "
+            "timeline is active");
+    }
+
+    // On a post-fork archive restart only the page secondary has a root at
+    // the latest finalized version; use it wherever init-time state is read.
+    bool const init_from_secondary = secondary_db.has_value() &&
+                                     triedb.get_root() == nullptr &&
+                                     secondary_db->get_root() != nullptr;
+    MONAD_ASSERT(
+        !init_from_secondary || as_eth_blocks,
+        "Primary frozen behind secondary db case only arises on historical "
+        "archive nodes which run the eth-blocks archive replay");
+    MONAD_ASSERT(
+        !init_from_secondary || statesync.empty(),
+        "The statesync server serves from the primary, which has no root at "
+        "recent versions when it is frozen behind the secondary");
+    MONAD_ASSERT(
+        !init_from_secondary || snapshot.empty(),
+        "The snapshot branch loads into the primary; with the primary frozen "
+        "behind the secondary the checkpoint would be loaded and then ignored");
+
+    TrieDb &init_triedb = init_from_secondary ? *secondary_db : triedb;
+    mpt::Db &init_raw_db = init_from_secondary ? *secondary_raw_db : raw_db;
+
     // Note: in memory db block number is always zero
     uint64_t const init_block_num = [&] {
         if (!snapshot.empty()) {
@@ -364,13 +406,13 @@ try {
             root = load_header(std::move(root), raw_db, block.header);
             triedb.reset_root(std::move(root), n);
         }
-        else if (triedb.get_root() == nullptr) {
+        else if (init_triedb.get_root() == nullptr) {
             MONAD_ASSERT(statesync.empty());
             LOG_INFO("loading from genesis");
             GenesisState const genesis_state = chain->get_genesis_state();
-            load_genesis_state(genesis_state, triedb);
+            load_genesis_state(genesis_state, init_triedb);
         }
-        return triedb.get_block_number();
+        return init_triedb.get_block_number();
     }();
 
     std::unique_ptr<monad::StateSyncServer> sync_server;
@@ -390,9 +432,9 @@ try {
         "last verified block = {}, state root = {}, time elapsed "
         "= {}",
         init_block_num,
-        raw_db.get_latest_finalized_version(),
-        raw_db.get_latest_verified_version(),
-        triedb.state_root(),
+        init_raw_db.get_latest_finalized_version(),
+        init_raw_db.get_latest_verified_version(),
+        init_triedb.state_root(),
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - load_start_time));
 
@@ -415,7 +457,10 @@ try {
     if (!db_in_memory) {
         mpt::AsyncIOContext io_ctx{mpt::ReadOnlyOnDiskDbConfig{
             .sq_thread_cpu = ro_sq_thread_cpu, .dbname_paths = dbname_paths}};
-        mpt::Db rodb{io_ctx};
+        mpt::Db rodb{
+            io_ctx,
+            init_from_secondary ? monad::mpt::timeline_id::secondary
+                                : monad::mpt::timeline_id::primary};
         initialized_headers_from_triedb = init_block_hash_buffer_from_triedb(
             rodb, start_block_num, block_hash_buffer);
     }
@@ -480,19 +525,6 @@ try {
         case CHAIN_CONFIG_MONAD_DEVNET:
         case CHAIN_CONFIG_MONAD_TESTNET:
         case CHAIN_CONFIG_MONAD_MAINNET: {
-            std::optional<mpt::Db> secondary_raw_db;
-            std::optional<TrieDb> secondary_db;
-            if (raw_db.timeline_active(monad::mpt::timeline_id::secondary)) {
-                secondary_raw_db = raw_db.open_secondary_timeline();
-                MONAD_ASSERT(secondary_raw_db.has_value());
-                MONAD_ASSERT(
-                    secondary_db->is_page_encoded(),
-                    "secondary timeline must be page-encoded");
-                MONAD_ASSERT(
-                    !db.is_page_encoded(),
-                    "primary must be slot-encoded when the secondary "
-                    "timeline is active");
-            }
             if (as_eth_blocks) {
                 return runloop_monad_ethblocks(
                     dynamic_cast<MonadChain const &>(*chain),

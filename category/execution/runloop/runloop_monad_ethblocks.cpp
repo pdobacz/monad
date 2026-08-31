@@ -424,21 +424,34 @@ Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
         monad_revision const rev =
             chain.get_monad_revision(block.header.timestamp);
 
-        // Storage encoding is fixed for the lifetime of the runloop (it
-        // matches the TrieDbImpl<page_encoded> backing `db`). If the
-        // replay crosses the mip-8 cutoff in either direction, the
-        // encoding the caller picked at startup no longer matches what
-        // this block's revision expects. With a secondary db both
-        // encodings are present (commit_block asserts slot primary +
-        // page secondary), so any revision is fine.
-        if (secondary_db == nullptr) {
+        // Pick the db(s) for this block's revision from each timeline's
+        // encoding. Pre-fork blocks execute on the slot db and commit to
+        // every open db (the page secondary is mirrored so it can take over
+        // at the fork). Post-fork (mip-8) blocks execute on and commit to
+        // the page-encoded db only, whether that is the primary or the
+        // secondary; the slot db, if present, stops growing at the cutoff.
+        Db *const page_db = db.is_page_encoded() ? &db : secondary_db;
+        Db *const slot_db = db.is_page_encoded() ? nullptr : &db;
+        Db *exec_db = nullptr;
+        Db *mirror_db = nullptr;
+        if (mip_8_active(rev)) {
             MONAD_ASSERT_PRINTF(
-                mip_8_active(rev) == db.is_page_encoded(),
-                "monad revision %d at block %lu crosses mip-8 cutoff "
-                "but db was opened with page_encoded=%d",
+                page_db != nullptr,
+                "monad revision %d at block %lu is past the mip-8 cutoff "
+                "but no page-encoded timeline is available",
                 rev,
-                block.header.number,
-                db.is_page_encoded());
+                block.header.number);
+            exec_db = page_db;
+        }
+        else {
+            MONAD_ASSERT_PRINTF(
+                slot_db != nullptr,
+                "monad revision %d at block %lu is before the mip-8 cutoff "
+                "but only a page-encoded timeline is available",
+                rev,
+                block.header.number);
+            exec_db = slot_db;
+            mirror_db = page_db;
         }
 
         ankerl::unordered_dense::segmented_set<Address> senders_and_authorities;
@@ -446,8 +459,8 @@ Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
             SWITCH_MONAD_TRAITS(
                 process_monad_block,
                 chain,
-                db,
-                secondary_db,
+                *exec_db,
+                mirror_db,
                 vm,
                 block_hash_buffer,
                 priority_pool,

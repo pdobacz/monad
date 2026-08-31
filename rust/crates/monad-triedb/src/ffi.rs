@@ -21,9 +21,10 @@ pub(crate) use self::bindings::{
     triedb_async_traverse_callback_triedb_async_traverse_callback_value, triedb_close,
     triedb_compute_page_key, triedb_compute_slot_offset, triedb_decode_storage_page_slot,
     triedb_earliest_version, triedb_finalize, triedb_free_valset, triedb_is_page_encoded,
-    triedb_latest_finalized_version, triedb_latest_proposed_block_id,
-    triedb_latest_proposed_version, triedb_latest_verified_version, triedb_latest_voted_block_id,
-    triedb_latest_voted_version, triedb_migration_phase, triedb_open, triedb_poll, triedb_read,
+    triedb_is_page_encoded_for_version, triedb_latest_finalized_version,
+    triedb_latest_proposed_block_id, triedb_latest_proposed_version,
+    triedb_latest_verified_version, triedb_latest_voted_block_id, triedb_latest_voted_version,
+    triedb_migration_phase, triedb_open, triedb_poll, triedb_primary_latest_version, triedb_read,
     triedb_read_valset, triedb_storage_stats, triedb_storage_stats_read, triedb_traverse,
     TriedbRoInner,
 };

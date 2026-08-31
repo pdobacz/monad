@@ -25,9 +25,11 @@
 #include <category/mpt/ondisk_db_config.hpp>
 #include <category/mpt/traverse.hpp>
 #include <category/mpt/traverse_util.hpp>
+#include <category/mpt/util.hpp>
 
 #include <quill/std/SystemError.h>
 
+#include <algorithm>
 #include <cassert>
 #include <filesystem>
 #include <iostream>
@@ -43,6 +45,16 @@ struct TriedbRoInner
     monad::mpt::Db db;
     monad::mpt::AsyncContext async_ctx;
 
+    // Page-encoded secondary timeline, opened when active. Both timelines
+    // share the one AsyncIOContext (an AsyncIO is one-per-thread); each Db
+    // owns its own UpdateAux over it, and the AsyncContext carries the
+    // timeline the async senders route by. On archive nodes the slot-encoded
+    // primary stops committing at the mip-8 cutoff, so post-fork versions
+    // are only on file in the secondary; versioned reads route to whichever
+    // timeline has the version (see db_for).
+    std::optional<monad::mpt::Db> secondary_db;
+    std::optional<monad::mpt::AsyncContext> secondary_async_ctx;
+
     explicit TriedbRoInner(
         std::vector<std::filesystem::path> dbname_paths,
         uint64_t const node_lru_max_mem)
@@ -52,6 +64,26 @@ struct TriedbRoInner
         , db{io_ctx}
         , async_ctx{db, node_lru_max_mem}
     {
+        if (db.timeline_active(monad::mpt::timeline_id::secondary)) {
+            secondary_db.emplace(io_ctx, monad::mpt::timeline_id::secondary);
+            secondary_async_ctx.emplace(*secondary_db, node_lru_max_mem);
+        }
+    }
+
+    // Pick the timeline that has `version` on file: the primary when it
+    // still has that version, otherwise the page-encoded secondary.
+    monad::mpt::Db &db_for(uint64_t const version)
+    {
+        if (secondary_db.has_value() && !db.version_is_valid_ondisk(version) &&
+            secondary_db->version_is_valid_ondisk(version)) {
+            return *secondary_db;
+        }
+        return db;
+    }
+
+    monad::mpt::AsyncContext &async_ctx_for(uint64_t const version)
+    {
+        return (&db_for(version) == &db) ? async_ctx : *secondary_async_ctx;
     }
 };
 
@@ -127,8 +159,8 @@ int triedb_read(
 
     *value = nullptr;
 
-    auto result =
-        db->db.find(key_to_nibbles_view(key, key_len_nibbles), block_id);
+    auto result = db->db_for(block_id).find(
+        key_to_nibbles_view(key, key_len_nibbles), block_id);
     if (!result.has_value()) {
         return -1;
     }
@@ -154,6 +186,16 @@ bool triedb_is_page_encoded(TriedbRoInner *const db)
         return false;
     }
     return db->db.state_machine_type() == monad::mpt::state_machine_kind::monad;
+}
+
+bool triedb_is_page_encoded_for_version(
+    TriedbRoInner *const db, uint64_t const version)
+{
+    if (db == nullptr) {
+        return false;
+    }
+    return db->db_for(version).state_machine_type() ==
+           monad::mpt::state_machine_kind::monad;
 }
 
 uint8_t triedb_migration_phase(TriedbRoInner *const db)
@@ -286,7 +328,7 @@ void triedb_async_read(
 {
     auto *state = new auto(monad::async::connect(
         monad::mpt::make_get_sender(
-            &db->async_ctx,
+            &db->async_ctx_for(block_id),
             key_to_nibbles_view(key, key_len_nibbles),
             block_id),
         AsyncReadReceiver{callback, user}));
@@ -436,7 +478,8 @@ bool triedb_traverse(
     triedb_async_traverse_callback_fn callback)
 {
     monad::mpt::NibblesView const prefix{0, key_len_nibbles, key};
-    auto cursor = db->db.find(prefix, block_id);
+    monad::mpt::Db &routed_db = db->db_for(block_id);
+    auto cursor = routed_db.find(prefix, block_id);
     if (!cursor.has_value()) {
         callback(
             triedb_async_traverse_callback_finished_early,
@@ -451,7 +494,8 @@ bool triedb_traverse(
     TraverseMachineWithCallback machine(
         context, callback, monad::mpt::NibblesView{});
 
-    bool const completed = db->db.traverse(cursor.value(), machine, block_id);
+    bool const completed =
+        routed_db.traverse(cursor.value(), machine, block_id);
 
     callback(
         completed ? triedb_async_traverse_callback_finished_normally
@@ -498,13 +542,14 @@ void triedb_async_ranged_get(
                 value.data(),
                 value.size());
         });
+    monad::mpt::AsyncContext &ctx = db->async_ctx_for(block_id);
     (new auto(monad::async::connect(
-         monad::mpt::make_get_node_sender(&db->async_ctx, prefix, block_id),
+         monad::mpt::make_get_node_sender(&ctx, prefix, block_id),
          GetRootForTraverseReceiver(
              context,
              callback,
              monad::mpt::make_traverse_sender(
-                 &db->async_ctx, {}, std::move(machine), block_id)))))
+                 &ctx, {}, std::move(machine), block_id)))))
         ->initiate();
 }
 
@@ -516,18 +561,21 @@ void triedb_async_traverse(
     monad::mpt::NibblesView const prefix{0, key_len_nibbles, key};
     auto machine = std::make_unique<TraverseMachineWithCallback>(
         context, callback, monad::mpt::NibblesView{});
+    monad::mpt::AsyncContext &ctx = db->async_ctx_for(block_id);
     (new auto(monad::async::connect(
-         monad::mpt::make_get_node_sender(&db->async_ctx, prefix, block_id),
+         monad::mpt::make_get_node_sender(&ctx, prefix, block_id),
          GetRootForTraverseReceiver(
              context,
              callback,
              monad::mpt::make_traverse_sender(
-                 &db->async_ctx, {}, std::move(machine), block_id)))))
+                 &ctx, {}, std::move(machine), block_id)))))
         ->initiate();
 }
 
 size_t triedb_poll(TriedbRoInner *db, bool const blocking, size_t const count)
 {
+    // Both timelines share one AsyncIO, so polling the primary handle pumps
+    // the secondary's reads too.
     return db->db.poll(blocking, count);
 }
 
@@ -569,10 +617,29 @@ uint64_t triedb_latest_verified_version(TriedbRoInner *db)
 
 uint64_t triedb_earliest_version(TriedbRoInner *db)
 {
-    return db->db.get_earliest_version();
+    uint64_t earliest = db->db.get_earliest_version();
+    if (db->secondary_db.has_value()) {
+        earliest = std::min(earliest, db->secondary_db->get_earliest_version());
+    }
+    return earliest;
 }
 
 uint64_t triedb_latest_version(TriedbRoInner *db)
+{
+    uint64_t latest = db->db.get_latest_version();
+    if (db->secondary_db.has_value()) {
+        uint64_t const secondary_latest =
+            db->secondary_db->get_latest_version();
+        if (latest == monad::mpt::INVALID_BLOCK_NUM ||
+            (secondary_latest != monad::mpt::INVALID_BLOCK_NUM &&
+             secondary_latest > latest)) {
+            latest = secondary_latest;
+        }
+    }
+    return latest;
+}
+
+uint64_t triedb_primary_latest_version(TriedbRoInner *db)
 {
     return db->db.get_latest_version();
 }
@@ -595,7 +662,8 @@ void triedb_free_valset(validator_set *valset)
 validator_set *triedb_read_valset(
     TriedbRoInner *db, size_t const block_num, uint64_t const requested_epoch)
 {
-    auto ret = monad::staking::read_valset(db->db, block_num, requested_epoch);
+    auto ret = monad::staking::read_valset(
+        db->db_for(block_num), block_num, requested_epoch);
     if (!ret.has_value()) {
         return nullptr;
     }

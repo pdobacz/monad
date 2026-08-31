@@ -43,6 +43,12 @@ int triedb_read(
 // is an encoded page; otherwise storage is slot-encoded.
 bool triedb_is_page_encoded(TriedbRoInner *);
 
+// true if the timeline that serves reads for `version` is page-encoded.
+// Versioned reads route to the primary when it has `version` on file and to
+// the page-encoded secondary otherwise, so during the dual-timeline migration
+// the storage encoding a reader must use depends on the version it queries.
+bool triedb_is_page_encoded_for_version(TriedbRoInner *, uint64_t version);
+
 // Dual-DB migration phase of the on-disk triedb, derived from the primary
 // timeline's state-machine kind and secondary-timeline presence (the same
 // pair monad-mpt reports). Read racily from the mmap'd metadata; safe on a
@@ -135,9 +141,15 @@ uint64_t triedb_latest_finalized_version(TriedbRoInner *);
 uint64_t triedb_latest_verified_version(TriedbRoInner *);
 
 // returns MAX if doesn't exist
+// Earliest version available on any timeline.
 uint64_t triedb_earliest_version(TriedbRoInner *);
 // returns MAX if doesn't exist
+// Latest version available on any timeline.
 uint64_t triedb_latest_version(TriedbRoInner *);
+// Latest version on file in the primary timeline. On an archive node past
+// the mip-8 cutoff this stays frozen at the cutoff block while the
+// page-encoded secondary keeps advancing.
+uint64_t triedb_primary_latest_version(TriedbRoInner *);
 
 #pragma pack(push, 1)
 

@@ -1243,10 +1243,47 @@ struct monad_executor
 
     mpt::RODb db_;
 
+    // Page-encoded secondary timeline, opened when active. On archive nodes
+    // the slot-encoded primary stops committing at the mip-8 cutoff, so
+    // post-fork versions are only on file here.
+    std::optional<mpt::RODb> secondary_db_;
+
     // The VM for executing eth calls needs to unconditionally use the
     // interpreter rather than the compiler. If it uses the compiler, then
     // out-of-gas errors can be misreported as generic failures.
     vm::VM vm_{vm::VM::InterpreterOnly};
+
+    static mpt::ReadOnlyOnDiskDbConfig make_db_config(
+        std::string const &triedb_path, uint64_t const node_lru_max_mem)
+    {
+        std::vector<std::filesystem::path> paths;
+        if (std::filesystem::is_directory(triedb_path)) {
+            for (auto const &file :
+                 std::filesystem::directory_iterator(triedb_path)) {
+                paths.emplace_back(file.path());
+            }
+        }
+        else {
+            paths.emplace_back(triedb_path);
+        }
+        return mpt::ReadOnlyOnDiskDbConfig{
+            .dbname_paths = std::move(paths),
+            .node_lru_max_mem = node_lru_max_mem};
+    }
+
+    // Pick the db that has `block_number` on file: the primary when it still
+    // has that version, otherwise the page-encoded secondary. Availability is
+    // re-validated inside the read path, so a version trimmed between here
+    // and the read fails the same way it always has.
+    mpt::RODb &select_db(uint64_t const block_number)
+    {
+        if (secondary_db_.has_value() &&
+            !db_.version_is_valid_ondisk(block_number) &&
+            secondary_db_->version_is_valid_ondisk(block_number)) {
+            return *secondary_db_;
+        }
+        return db_;
+    }
 
     monad_executor(
         monad_executor_pool_config const &low_pool_config,
@@ -1265,26 +1302,16 @@ struct monad_executor
               block_pool_config.queue_limit,
               std::chrono::seconds(block_pool_config.timeout_sec),
               trace_thread_pool_.create_fiber_group(tx_exec_num_fibers)}
-        , db_{[&] {
-            std::vector<std::filesystem::path> paths;
-            if (std::filesystem::is_directory(triedb_path)) {
-                for (auto const &file :
-                     std::filesystem::directory_iterator(triedb_path)) {
-                    paths.emplace_back(file.path());
-                }
-            }
-            else {
-                paths.emplace_back(triedb_path);
-            }
-
-            // create the db instances on the PriorityPool thread so all the
-            // thread local storage gets instantiated on the one thread its
-            // used
-            auto const config = mpt::ReadOnlyOnDiskDbConfig{
-                .dbname_paths = paths, .node_lru_max_mem = node_lru_max_mem};
-            return mpt::RODb{config};
-        }()}
+        // create the db instances on the PriorityPool thread so all the
+        // thread local storage gets instantiated on the one thread its
+        // used
+        , db_{make_db_config(triedb_path, node_lru_max_mem)}
     {
+        if (db_.timeline_active(mpt::timeline_id::secondary)) {
+            secondary_db_.emplace(
+                make_db_config(triedb_path, node_lru_max_mem),
+                mpt::timeline_id::secondary);
+        }
     }
 
     monad_executor(monad_executor const &) = delete;
@@ -1352,7 +1379,7 @@ struct monad_executor
              block_header = block_header,
              block_number = block_number,
              block_id = block_id,
-             &db = db_,
+             &db = select_db(block_number),
              sender = sender,
              result = result,
              complete = complete,
@@ -1663,7 +1690,7 @@ struct monad_executor
              block_number = block_number,
              chain_config = chain_config,
              complete = complete,
-             &db = db_,
+             &db = select_db(block_number),
              fiber_group = &trace_block_group_,
              tx_exec_group = &trace_tx_exec_group_,
              grandparent_id = grandparent_id,
@@ -1886,7 +1913,7 @@ struct monad_executor
              block_id = block_id,
              grandparent_id = grandparent_id,
              chain_config = chain_config,
-             &db = db_,
+             &db = select_db(block_number),
              gas_limit = gas_limit,
              max_calls = max_calls,
              emit_native_transfer_logs = emit_native_transfer_logs,

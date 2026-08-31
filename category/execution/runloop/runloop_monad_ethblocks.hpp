@@ -39,6 +39,10 @@ namespace fiber
     class PriorityPool;
 }
 
+// `secondary_db`, when non-null, is a page-encoded secondary timeline paired
+// with a slot-encoded primary `db`. Pre-fork (mip-8 inactive) blocks commit
+// to every open db; post-fork blocks execute on and commit to the
+// page-encoded db only, whether that is the primary or the secondary.
 Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
     MonadChain const &, std::filesystem::path const &, Db &, Db *secondary_db,
     vm::VM &, BlockHashBufferFinalized &, fiber::PriorityPool &, uint64_t &,

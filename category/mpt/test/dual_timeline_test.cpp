@@ -420,6 +420,209 @@ namespace
     }
 
     // -------------------------------------------------------------------
+    // Test: reopening with rewind_to_latest_finalized when the primary is
+    // frozen behind the secondary (the archive shape where the primary
+    // stops committing at the mip-8 cutoff). The rewind must accept a
+    // finalized version only the secondary has, rewind the secondary's
+    // unfinalized tail, and leave the primary untouched.
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, rewind_to_finalized_with_frozen_primary)
+    {
+        auto const pk = 0x1111111111111111_bytes;
+        for (uint64_t v = 0; v <= 4; v++) {
+            primary_root = upsert_kv(primary_root, pk, pk, v);
+        }
+
+        // The secondary advances to 7 while the primary stays frozen at 4;
+        // 6 is the last finalized version.
+        activate_secondary();
+        auto const sk = 0xAAAAAAAAAAAAAAAA_bytes;
+        for (uint64_t v = 5; v <= 7; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, sk, sk, v, timeline_id::secondary);
+        }
+        db.update_finalized_version(6);
+
+        // Reopen the primary with rewind_to_latest_finalized, as production
+        // does on restart.
+        secondary_db.reset();
+        {
+            Db const expired = std::move(db);
+        }
+        OnDiskDbConfig reopen_config = config;
+        reopen_config.append = true;
+        reopen_config.rewind_to_latest_finalized = true;
+        db = Db{std::make_unique<StateMachineAlwaysMerkle>(), reopen_config};
+        secondary_db.emplace(*db.open_secondary_timeline(
+            std::make_unique<StateMachineAlwaysMerkle>()));
+
+        EXPECT_EQ(db.get_latest_finalized_version(), 6);
+        // The primary is untouched; the secondary's unfinalized version 7
+        // is rewound away.
+        EXPECT_EQ(db.get_latest_version(), 4);
+        EXPECT_EQ(secondary_db->get_latest_version(), 6);
+
+        // Data on both timelines stays readable at their tips.
+        primary_root = db.load_root_for_version(4);
+        ASSERT_NE(primary_root, nullptr);
+        auto const pres = db_get(db, primary_root, NibblesView{pk}, 4);
+        ASSERT_TRUE(pres.has_value());
+        EXPECT_EQ(pres.value(), monad::byte_string{pk});
+
+        secondary_root = secondary_db->load_root_for_version(6);
+        ASSERT_NE(secondary_root, nullptr);
+        auto const sres =
+            db_get(*secondary_db, secondary_root, NibblesView{sk}, 6);
+        ASSERT_TRUE(sres.has_value());
+        EXPECT_EQ(sres.value(), monad::byte_string{sk});
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: async senders route root lookups and version checks by the
+    // timeline their AsyncContext's Db is bound to
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, async_context_reads_secondary_timeline)
+    {
+        auto const pk = 0x1111111111111111_bytes;
+        for (uint64_t v = 0; v <= 4; v++) {
+            primary_root = upsert_kv(primary_root, pk, pk, v);
+        }
+
+        // The secondary diverges with its own key at versions 5-6 while the
+        // primary stays frozen at 4.
+        activate_secondary();
+        auto const sk = 0xAAAAAAAAAAAAAAAA_bytes;
+        for (uint64_t v = 5; v <= 6; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, sk, sk, v, timeline_id::secondary);
+        }
+
+        // One AsyncIOContext for both timelines: an AsyncIO is
+        // one-per-thread, and two RO-blocking Dbs can share one.
+        AsyncIOContext io_ctx{ReadOnlyOnDiskDbConfig{.dbname_paths = {dbname}}};
+        Db ro_primary{io_ctx};
+        Db ro_secondary{io_ctx, timeline_id::secondary};
+        auto const primary_ctx = async_context_create(ro_primary);
+        auto const secondary_ctx = async_context_create(ro_secondary);
+
+        // Async completions run on the polling thread (this one).
+        size_t callbacks = 0;
+        std::optional<monad::byte_string> last_value;
+
+        struct GetReceiver
+        {
+            size_t *callbacks;
+            std::optional<monad::byte_string> *last_value;
+
+            void set_value(
+                monad::async::erased_connected_operation *const state,
+                monad::async::result<monad::byte_string> res)
+            {
+                if (res.has_value()) {
+                    *last_value = std::move(res).assume_value();
+                }
+                else {
+                    last_value->reset();
+                }
+                ++*callbacks;
+                delete state;
+            }
+        };
+
+        // The expected-failure lookups need no IO and complete synchronously
+        // inside initiate(), so the target must be computed before it.
+        auto const async_get = [&](AsyncContext *const ctx,
+                                   Db &ro,
+                                   monad::byte_string const &key,
+                                   uint64_t const version) {
+            size_t const target = callbacks + 1;
+            auto *state = new auto(monad::async::connect(
+                make_get_sender(ctx, NibblesView{key}, version),
+                GetReceiver{&callbacks, &last_value}));
+            state->initiate();
+            while (callbacks < target) {
+                ro.poll(false);
+            }
+        };
+
+        // A version only the secondary has resolves through the
+        // secondary-bound context and fails through the primary-bound one.
+        async_get(secondary_ctx.get(), ro_secondary, sk, 6);
+        ASSERT_TRUE(last_value.has_value());
+        EXPECT_EQ(*last_value, monad::byte_string{sk});
+        async_get(primary_ctx.get(), ro_primary, sk, 6);
+        EXPECT_FALSE(last_value.has_value());
+
+        // And symmetrically for a version only the primary has.
+        async_get(primary_ctx.get(), ro_primary, pk, 4);
+        ASSERT_TRUE(last_value.has_value());
+        EXPECT_EQ(*last_value, monad::byte_string{pk});
+        async_get(secondary_ctx.get(), ro_secondary, pk, 4);
+        EXPECT_FALSE(last_value.has_value());
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: RODb bound to the secondary timeline serves versions the
+    // primary does not have (the archive shape where the primary stops
+    // committing at the mip-8 cutoff)
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, rodb_reads_secondary_timeline)
+    {
+        auto const pk = 0x1111111111111111_bytes;
+        for (uint64_t v = 0; v <= 4; v++) {
+            primary_root = upsert_kv(primary_root, pk, pk, v);
+        }
+
+        // The secondary diverges with its own key at versions 5-6 while the
+        // primary stays frozen at 4.
+        activate_secondary();
+        auto const sk = 0xAAAAAAAAAAAAAAAA_bytes;
+        for (uint64_t v = 5; v <= 6; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, sk, sk, v, timeline_id::secondary);
+        }
+
+        {
+            ReadOnlyOnDiskDbConfig const ro_config{.dbname_paths = {dbname}};
+            RODb ro_primary{ro_config};
+            RODb ro_secondary{ro_config, timeline_id::secondary};
+
+            EXPECT_TRUE(ro_primary.timeline_active(timeline_id::secondary));
+
+            // Each handle reports its own timeline's version range.
+            EXPECT_EQ(ro_primary.get_latest_version(), 4);
+            EXPECT_EQ(ro_secondary.get_latest_version(), 6);
+            EXPECT_TRUE(ro_primary.version_is_valid_ondisk(4));
+            EXPECT_FALSE(ro_primary.version_is_valid_ondisk(6));
+            EXPECT_TRUE(ro_secondary.version_is_valid_ondisk(6));
+
+            // A version only the secondary has is readable through the
+            // secondary-bound handle and rejected by the primary-bound one.
+            auto const sres = ro_secondary.find(NibblesView{sk}, 6);
+            ASSERT_TRUE(sres.has_value());
+            EXPECT_EQ(
+                monad::byte_string{sres.value().node->value()},
+                monad::byte_string{sk});
+            EXPECT_FALSE(ro_primary.find(NibblesView{sk}, 6).has_value());
+
+            // The primary keys stay readable at the primary's frozen tip
+            // and are absent from the secondary's trie.
+            auto const pres = ro_primary.find(NibblesView{pk}, 4);
+            ASSERT_TRUE(pres.has_value());
+            EXPECT_EQ(
+                monad::byte_string{pres.value().node->value()},
+                monad::byte_string{pk});
+            EXPECT_FALSE(ro_secondary.find(NibblesView{pk}, 6).has_value());
+        }
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
     // Test: Primary ahead of secondary by several versions
     // -------------------------------------------------------------------
     TEST_F(DualTimelineFixture, primary_ahead_of_secondary)

@@ -283,6 +283,15 @@ impl TriedbHandle {
         unsafe { ffi::triedb_is_page_encoded(self.db_ptr) }
     }
 
+    /// True if the timeline that serves reads for `version` is page-encoded.
+    /// During the dual-timeline migration, versioned reads route to the
+    /// primary when it has the version on file and to the page-encoded
+    /// secondary otherwise (archive nodes stop committing the slot primary at
+    /// the mip-8 cutoff), so the storage encoding depends on the version.
+    pub fn is_page_encoded_for_version(&self, version: u64) -> bool {
+        unsafe { ffi::triedb_is_page_encoded_for_version(self.db_ptr, version) }
+    }
+
     /// The on-disk dual-DB migration phase. Cheap (a couple of loads from the
     /// mmap'd metadata) and safe on a read-only handle while execution writes.
     pub fn migration_phase(&self) -> MigrationPhase {
@@ -516,6 +525,13 @@ impl TriedbHandle {
 
     pub fn earliest_finalized_block(&self) -> Option<u64> {
         parse_triedb_block_num(unsafe { ffi::triedb_earliest_version(self.db_ptr) })
+    }
+
+    /// Latest version on file in the primary timeline. On an archive node
+    /// past the mip-8 cutoff this stays frozen at the cutoff block while the
+    /// page-encoded secondary keeps advancing.
+    pub fn primary_latest_version(&self) -> Option<u64> {
+        parse_triedb_block_num(unsafe { ffi::triedb_primary_latest_version(self.db_ptr) })
     }
 
     pub fn validator_set_at_block(
